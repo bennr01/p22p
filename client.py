@@ -1,7 +1,7 @@
 # coding: utf-8
-"""the P22P-Client. Also contains a single-file UI."""
+"""the P22P-Client. Also contains a single-file UI and a argument interface."""
 
-import socket,select,struct,hashlib,base64,time,threading,cmd,sys,atexit
+import socket,select,struct,hashlib,base64,time,threading,cmd,sys,atexit,zlib,os,argparse
 import autobahn.twisted.websocket as websocket
 import twisted.internet
 from twisted.internet import reactor
@@ -12,12 +12,13 @@ except:
 	ssl=None
 
 #constants
-VERSION=0.2
+VERSION=0.3
 PROTOCOLS=["P22P-WS-P"]
 USER_AGENT="P22P/{v}".format(v=VERSION)
 DEBUG=("-d" in sys.argv)
 ISETO=0.02
 RECV_BUFF=4096
+COMPRESSION=7
 
 ID_CTRL="\x01"
 ID_PC="\x02"
@@ -102,11 +103,14 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 		self.cid=None
 		self.joinstate=0#0=Not joining, 1=waiting, 2=Success, 3=Fail
 		self.createstate=0#0=Not creating, 1=waiting, 2=Success, 3=Fail
+		self.reservestate=0#0=Not reserving, 1=waiting, str=Success, 3=Fails
+		self.extendstate=0#see above
 		self.pingstates={}
 		self.ai2s={}#map ai to s (ai=Adress info)
 		self.ls={}#list of listening sockets
 		self.s2ai={}#map sockets to ai
 		self.s2i={}#map sockets to info
+		self.whitelist=None
 		self.AL=threading.Lock()
 		reactor.callInThread(self.__loop)#use deffereds instead?
 	def clientConnectionFailed(self,connector,reason):
@@ -132,6 +136,10 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 			sys.stdout.write("Connection closed.\n")
 		if not wasclean:
 			raise CommunicationError("WS-Error {n}: {r}!".format(n=code,r=reason))
+		else:
+			try: reactor.stop()
+			except ReactorNotRunning:
+				pass
 	def onMessage(self,msg,isBinary):
 		"""called when a message is received."""
 		if DEBUG:
@@ -162,6 +170,14 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 				self.createstate=2
 			elif payload=="E:NOCREATE":
 				self.createstate=3
+			elif payload.startswith("I:RESERVE"):
+				self.reservestate=payload[9:]
+			elif payload=="E:NORESERVE":
+				self.reservestate=3
+			elif payload.startswith("I:EXTEND"):
+				self.extendstate=payload[8:]
+			elif payload=="E:NOEXTEND":
+				self.extendstate=3
 			elif payload.startswith("LEAVE") and len(payload)==6:
 				pid=ord(payload[-1])
 				self.AL.acquire()
@@ -189,6 +205,10 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 			elif payload.startswith("BRIDGE") and len(payload)==10:
 				lp,pp=struct.unpack("!HH",payload[6:])
 				ai=(sender,pp)
+				if isinstance(self.whitelist,list) or isinstance(self.whitelist,tuple):
+					if not lp in self.whitelist:
+						self.__send_close(ai)
+						return
 				try:
 					s=socket.socket()
 					s.connect(("localhost",lp))
@@ -200,21 +220,31 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 				except:
 					self._close_s(s)
 			elif payload.startswith("CLOSE") and len(payload)==8:
-				c=payload[5]
+				c=ord(payload[5])
 				lp=struct.unpack("!H",payload[6:])[0]
 				ai=(c,lp)
 				self.AL.acquire()
-				s=self.ai2s[ai]
-				self._close_s(s,send_close=False)
+				try:
+					s=self.ai2s[ai]
+					self._close_s(s,send_close=False)
+				except KeyError:
+					pass
 				self.AL.release()
 		elif idb==ID_MSG:
 			sender,creator,pi,payload=ord(payload[0]),ord(payload[1]),payload[2:4],payload[4:]
 			lp=struct.unpack("!H",pi)[0]
 			ai=(creator,lp)
-			tosend=decrypt(payload,self.__key)
+			comp=decrypt(payload,self.__key)
+			if COMPRESSION>0:
+				tosend=zlib.decompress(comp)
+			else: tosend=comp
 			length=len(tosend)
 			self.AL.acquire()
-			s=self.ai2s[ai]
+			try:
+				s=self.ai2s[ai]
+			except KeyError:
+				self.AL.release()
+				return
 			self.s2i[s]["recv"]+=length
 			self.AL.release()
 			try:
@@ -269,14 +299,17 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 						self._close_s(s)
 						continue
 					pi=struct.pack("!H",ai[1])
-					tosend=encrypt(data,self.__key)
+					if COMPRESSION>0:
+						comp=zlib.compress(data,COMPRESSION)
+					else: comp=data
+					tosend=encrypt(comp,self.__key)
 					self.send_to(info["peer"],ID_MSG+chr(ai[0])+pi+tosend)
 			for s in wa:
 				pass
 			self.AL.release()
 	def __send_close(self,ai):
 		"""tells peer that conn on port was closed."""
-		peer=self.s2i[self.ai2s[ai]]
+		peer=self.s2i[self.ai2s[ai]]["peer"]
 		self.send_to(peer,ID_PC+"CLOSE"+chr(ai[0])+struct.pack("!H",ai[1]))
 	def _close_s(self,s,send_close=True):
 		"""closes a socket. Does not acquire intern lock."""
@@ -314,13 +347,16 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 		self.joinstate=0
 		self.createstate=0
 		self.sendClose()
-	def create_group(self,name,pswd):
-		"""creates and joins a group. returns True if it was created, otherwise False"""
+	def create_group(self,name,pswd,key=None):
+		"""creates and joins a group. returns True if it was created, otherwise False. key is optional and is a key for creating a group with a reserved name."""
 		if not self.did_handshake:
 			return False
-		hpo=hashlib.sha256(name)
+		hpo=hashlib.sha256(pswd)
 		hp=hpo.digest()
-		tosend="\x00".join([base64.b64encode(e) for e in (name,pswd)])
+		tozip=[name,hp]
+		if key is not None:
+			tozip.append(key)
+		tosend="\x00".join([base64.b64encode(e) for e in tozip])
 		self.sendMessage(ID_CTRL+"CREATE"+tosend,True)
 		self.createstate=1
 		while self.createstate==1:
@@ -334,9 +370,9 @@ class P22PClientProtocol(websocket.WebSocketClientProtocol):
 			return False
 	def join_group(self,name,pswd):
 		"""joins a group"""
-		hpo=hashlib.sha256(name)
+		hpo=hashlib.sha256(pswd)
 		hp=hpo.digest()
-		tosend="\x00".join([base64.b64encode(e) for e in (name,pswd)])
+		tosend="\x00".join([base64.b64encode(e) for e in (name,hp)])
 		self.sendMessage(ID_CTRL+"JOIN"+tosend,True)
 		self.joinstate=1
 		while self.joinstate==1:
@@ -416,6 +452,37 @@ send: int or None
 			res.append(("Conn",fai,info["local"],tai,info["port"],info["recv"],info["send"]))
 		self.AL.release()
 		return res
+	def reserve_group(self,name,sco=True):
+		"""reserves a froup and returns the key. if sco, only medsages between creator and clients are allowed."""
+		if isinstance(self.reservestate,str):
+			#already reserved, server wouldnt handle the request
+			raise UsageError("Already reserved a Group!")
+		elif not name.startswith("#"):
+			raise UsageError("Reserved Groupnames need to start with a '#'!")
+		tosend=name+("T" if sco else "F")
+		self.reservestate=1
+		self.sendMessage(ID_CTRL+"RESERVE"+tosend,True)
+		while self.reservestate==1:
+			pass
+		if isinstance(self.reservestate,str):
+			return self.reservestate
+		else:
+			self.reservestate=0
+			return False
+	def extend_reservation(self,key):
+		"""extends the reservation for the group."""
+		self.extendstate=1
+		self.sendMessage(ID_CTRL+"EXTEND"+key,True)
+		while self.extendstate==1:
+			pass
+		if isinstance(self.extendstate,str):
+			ret=self.extendstate
+			self.extendstate=0
+			return ret
+		else:
+			self.extendstate=0
+			return False
+		
 
 class P22PClientFactory(websocket.WebSocketClientFactory):
 	"""The Factory for the P22P-Client"""
@@ -452,6 +519,8 @@ class P22PClient(object):
 			if self.client is False:
 				self.client=None
 				raise ConnectionError("Cant connect to Server!")
+			while not self.client.did_handshake:
+				pass
 		except:
 			self.factory=None
 			self.client=None
@@ -468,11 +537,11 @@ class P22PClient(object):
 		self.client=None
 		self.factory=None
 	close=disconnect#alias for disconnect
-	def create(self,name,pswd):
+	def create(self,name,pswd,key=None):
 		"""Creates a Group."""
 		if self.client is None:
 			raise UsageError("Not connected!")
-		return self.client.create_group(name,pswd)
+		return self.client.create_group(name,pswd,key)
 	def join(self,name,pswd):
 		"""Joins a Group."""
 		if self.client is None:
@@ -503,6 +572,24 @@ class P22PClient(object):
 		if self.client is None:
 			raise UsageError("Not connected!")
 		return self.client.list_conns()
+	def reserve_group(self,name,sco):
+		"""reserves a group (only owner of the key can create them) and returns the key on success. Otherwise returns False.
+		if sco is True, only the creator of the group and the clients can communicate, otherwise clients can communicate with esch other."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.reserve_group(name,sco)
+	def extend_reservation(self,key):
+		"""extends a key for a reservation. key needs to be valid at this moment."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.extend_reservation(key)
+	def set_whitelist(self,wl):
+		"""sets the whitelist of ports. if wl is None, disable the whitelist."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		if not (isinstance(wl,list) or isinstance(wl,tuple) or (wl is None)):
+			raise ValueError("wl needs to be a list, tupler or None!")
+		self.client.whitelist=wl
 
 #Single-File User Interface
 
@@ -541,15 +628,28 @@ class P22PClientConsole(cmd.Cmd):
 		self.client.disconnect()
 		self.ingroup=False
 	def do_create(self,cmd):
-		"""create GROUP PSWD: creates and joins a group."""
+		"""create GROUP PSWD [KEYFILE]: creates and joins a group."""
 		if self.ingroup:
 			self.stdout.write("Error: Already in a Group!\n")
 			return
 		try:
-			name,pswd=cmd.split(" ")
+			data=cmd.split(" ")
+			if len(data)==2:
+				name,pswd=data
+				key=None
+			elif len(data)==3:
+				name,pswd,keypath=data
+				if not os.path.isfile(keypath):
+					self.stdout.write("Error: KEYPATH does not refer to a valid file!\n")
+					return
+				with open(keypath,"rb") as f:
+					key=f.read()
+			else:
+				raise Exception("see except:")
 		except:
 			self.stdout.write("Error: Invalid Argument!\n")
-		s=self.client.create(name,pswd)
+			return
+		s=self.client.create(name,pswd,key)
 		if s:
 			self.stdout.write("Group created and joined.\n")
 			self.ingroup=True
@@ -594,7 +694,7 @@ class P22PClientConsole(cmd.Cmd):
 		ping=self.client.ping(cid)
 		self.stdout.write("Ping to target is {p} seconds.\n".format(p=ping))
 	def do_exit(self,cmd):
-		"""exit: exits the program and fieconnrcts if required."""
+		"""exit: exits the program and disconnects if required."""
 		if self.client.client is not None:
 			self.client.disconnect()
 		self.reactor.callFromThread(self.reactor.stop)
@@ -651,6 +751,55 @@ class P22PClientConsole(cmd.Cmd):
 			text=(("{:>9}|"*7)[:-1]).format(*l).replace("None","----")
 			self.stdout.write(text+"\n")
 		self.stdout.write("\n")
+	def do_reserve(self,cmd):
+		"""
+reserve NAME CONNTYPE OUTFILE: reserves the groupname NAME and writes the key to KEYFILE.
+CONNTYPE should be one either ALL (=everyone can connect to everyone) or SCO (=only connections to/from creator are allowed).
+NAME needs to start with a '#'.
+"""
+		try:
+			name,ct,of=cmd.split(" ")
+			if not name.startswith("#"):
+				raise Exception("see except:")
+			if ct=="ALL": sco=False
+			elif ct=="SCO": sco=True
+			else:
+				raise Exception("see except:")
+		except:
+			self.stdout.write("Error: Invalid Argument!\n")
+			return
+		key=self.client.reserve_group(name,sco)
+		if not key:
+			self.stdout.write("Error: cannot reserve Group!")
+			return
+		try:
+			with open(of,"wb") as f: f.write(key)
+		except:
+			self.stdout.write("Error: Cant save Key!\nPlease write this lanually to {p}:\n{k}\n".format(p=of,k=key))
+			return
+		self.stdout.write("Group reserved.\n")
+	def do_extend(self,cmd):
+		"""extend KEYPATH: extends the reservation with the key in file KEYPATH."""
+		kf=cmd
+		if not os.path.isfile(kf):
+			self.stdout.write("Error: Cannot find KEYFILE!\n")
+			return
+		try:
+			with open(kf,"rb") as f: key=f.read()
+			if len(key)==0:
+				raise Exception("see except:")
+		except:
+			self.stdout.write("Error: Cannot read KEYFILE!\n")
+			return
+		nk=self.client.extend_reservation(key)
+		if not nk:
+			self.stdout.write("Error: Cannot extend key. Is key valid?\n")
+			return
+			try:
+				with open(kp,"wb") as f: f.write(nk)
+			except:
+				self.stdout.write("Error: Cannot save new key! Please savt this to {p}:\n{k}\n".format(p=kp,k=nk))
+				return
 	def help_usage(self):
 		"""shows a text how to use p22p."""
 		helptext="""
@@ -671,8 +820,10 @@ USAGE
 	p22p is using Group as Network-Namespaces.
 	Each Groupmember has a unique CID. However, the CID is only unique in the Group and only unique during that clients connection.
 	To create a new Group, use the 'create'-command:
-		create NAME PASSWORD
+		create NAME PASSWORD [KEYFILE]
 	The server only receives a hash of the PASSWORD.
+	Note that groupnames starting with a "#" are reserved (You cant create them except if you have the key).
+	If you want to create a reserved group, pass the path to the keyfile.
 	When creating a Group, you will automatically join that Group.
 	
 	To join a Group, use the 'join'-command:
@@ -717,13 +868,74 @@ USAGE
 def _stop():
 	"""stops the reactor."""
 	try:
-		reactor.stop()
+		reactor.callFromThread(reactor.stop)
 	except ReactorNotRunning,arg:
 		pass
 		
 if __name__=="__main__":
-	cmdo=P22PClientConsole(reactor)
 	atexit.register(_stop)
-	reactor.callInThread(cmdo.cmdloop)
 	reactor.addSystemEventTrigger("after","shutdown",sys.exit,(0,))
-	reactor.run()
+	if len(sys.argv)==1 or (len(sys.argv)==2 and ("-d" in sys.argv)):
+		cmdo=P22PClientConsole(reactor)
+		reactor.callInThread(cmdo.cmdloop)
+		reactor.run()
+	else:
+		if "-d" in sys.argv: sys.argv.remove("-d")
+		def _to_portlist(arg):
+			try:
+				peer,local,remote=arg.split(":")
+				peer,local,remote=int(peer),int(local),int(remote)
+				if peer>255 or peer<0 or local<0 or remote<0:
+					raise Exception("see except:")
+				return (peer,local,remote)
+			except:
+				raise argparse.ArgumentTypeError("Invalid format for portlist!")
+		parser=argparse.ArgumentParser(description="Connect to the P22P-Network")
+		parser.add_argument("-a",action="store",dest="address",default=DEFAULT_SERVER,help="address of server")
+		parser.add_argument("command",action="store",help="What to do",choices=("create","join"))
+		parser.add_argument("name",action="store",help="Name of Group")
+		parser.add_argument("pswd",action="store",help="Password for Group")
+		parser.add_argument("-k",action="store",dest="keyfile",help="Keyfile used for creating the Group")
+		parser.add_argument("-n",action="store_false",dest="extend",help="do not extend keyfile")
+		#parser.add_argument("-t",action="store",dest="type",help="Type of Network",choices=("ALL","SCO"))
+		parser.add_argument("-p",action="store",dest="conns",help="ports to relay as PEER:LOCAL:REMOTE",nargs="+",type=_to_portlist,default=[],metavar="CONN")
+		parser.add_argument("-w",nargs="+",type=int,dest="whitelist",default=None,help="ports to whitelist (default: all)",action="store",metavar="PORT")
+		ns=parser.parse_args()
+		if ns.keyfile is not None:
+			if not os.path.isfile(ns.keyfile):
+				print "Error: can not find file '{k}'!".format(k=ns.keyfile)
+				sys.exit(1)
+			with open(ns.keyfile,"rb") as f:
+				key=f.read()
+		else:
+			key=None
+		def handle_commands(ns,key):
+			try:
+				client=P22PClient(None,reactor)
+				client.connect(ns.address)
+				client.set_whitelist(ns.whitelist)
+				if ns.command=="create":
+					if ns.extend and (key is not None):
+						nk=client.extend_reservation(key)
+						if nk:
+							with open(ns.keyfile,"wb") as f:
+								f.write(nk)
+							key=nk
+					state=client.create(ns.name,ns.pswd,key)
+					if not state:
+						print "Error: Can not create Group!"
+						sys.exit(1)
+				elif ns.command=="join":
+					state=client.join(ns.name,ns.pswd)
+					if not state:
+						print "Error: Can not join Group!"
+						sys.exit(1)
+					for peer,local,remote in ns.conns:
+						client.relay(peer,remote,local)
+			except:
+				try:
+					_stop()
+				finally:
+					raise
+		reactor.callInThread(handle_commands,ns,key)
+		reactor.run()
