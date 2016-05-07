@@ -1,171 +1,189 @@
 # coding: utf-8
-"""The p22p Server."""
-import socket,select,struct,os
+"""The p22p-server script/module. requires autobahn+twisted."""
+import sys,struct,base64,os
+from autobahn.twisted import websocket
+import twisted.python
+import twisted.internet
+from twisted.internet.defer import inlineCallbacks
 
 #constants
-VERSION=0.1
-DEBUG=False
-TIMEOUT=None
+VERSION=0.2
+PROTOCOLS=["P22P-WS-P"]
+DEBUG=("-d" in sys.argv)
 ID_CTRL="\x01"
-ID_MSG="\x02"
-ID_PPC="\x03"
 
-def recv_exact(s,nbytes):
-	"""receives exact nbytes from s."""
-	if os.name=="nt":
-		#windows
-		tr=nbytes
-		ret=""
-		while True:
-			data=s.recv(tr)
-			tr-=len(data)
-			ret+=data
-			if tr<=0:
-				return ret
-	else:
-		return s.recv(nbytes,socket.MSG_WAITALL)
+#communication
 
-class P22pServer(object):
-	"""The p22p-Server."""
-	def __init__(self):
-		self.s=None
-		self.cmid=0
-		self.conns={}
-		self.id2s={}
-	def get_new_id(self):
-		"""returns a new id."""
-		cid=self.cmid
-		self.cmid+=1
-		return cid
-	def add_s(self,s):
-		"""adds a socket to the select-loop."""
-		try:
-			s.settimeout(TIMEOUT)
-			pv=struct.unpack("!d",recv_exact(s,8))[0]
-			if pv!=VERSION:
-				s.send("F")
-				s.close()
-			s.send("T")
-			nid=self.get_new_id()
-			s.send(struct.pack("!Q",nid))
-			pwlength=struct.unpack("!Q",recv_exact(s,8))[0]
-			hpw=recv_exact(s,pwlength)
-			self.id2s[nid]=s
-			self.conns[s]={"id":nid,"peer":None,"pswd":hpw}
-		except Exception,arg:
-			if DEBUG: raise
+class Group(object):
+	"""A Group manages the communication between clients"""
+	def __init__(self,srv,name,pswd):
+		self.srv=srv
+		self.name=name
+		self.pswd=pswd
+		self.members={}
+		self.c2id={}
+	def new_cid(self):
+		"""returns a new client id or None"""
+		cids=self.members.keys()#only check one time to improve perfomance
+		for i in xrange(256):
+			if i not in cids:
+				return i
+		return False
+	def join(self,client,pswd):
+		"""check pswd and add client as member of this group if pswd match. return his new id if joined else False."""
+		if pswd!=self.pswd:
+			return False
+		if len(self.members.keys())>=256:
+			#no ids left
+			return False
+		nid=self.new_cid()
+		if nid is False:
+			return False
+		self.members[nid]=client
+		self.c2id[client]=nid
+		client.group=self
+		return nid
+	def leave(self,client):
+		"""remove client from group"""
+		cid=self.c2id[client]
+		self.send_leave(cid)
+		del self.c2id[client]
+		del self.members[cid]
+		if len(self.members.keys())<=0:
+			#remove this group
+			del self.srv.groups[self.name]
+	def send_leave(self,cid):
+		"""tells the members that this client left the group."""
+		for client in self.c2id.keys():
+			if self.c2id[client]==cid:
+				continue
+			client.send_to_client(ID_CTRL+"LEAVE"+chr(cid))
+	def send_to(self,cid,pid,msg):
+		"""sends a message to client pid."""
+		if pid not in self.members.keys():
+			return
+		client=self.members[pid]
+		idb,payload=msg[0],msg[1:]
+		client.send_to_client(idb+chr(cid)+payload)
+
+class P22PServerProtocol(websocket.WebSocketServerProtocol):
+	"""The Protocol handles the communication and the connection."""
+	def __init__(self,*args,**kwargs):
+		nargs=tuple([self]+list(args))
+		apply(websocket.WebSocketServerProtocol.__init__,nargs,kwargs)
+		self.group=None
+		self.cid=None
+		self.s2g={}
+		self.g2s={}
+		self.did_handshake=False
+	def leave_group(self):
+		"""leaves the group"""
+		if self.group is None:
+			return
+		self.group.leave(self)
+		self.group=None
+		self.cid=None
+		#self.did_handshake=False#why is this here? lets comment it out
+		self.g2s={}
+		self.s2g={}
+	def send_to_client(self,msg):
+		"""sends a message to this client"""
+		self.sendMessage(msg,True)
+	def processHandshake(self):
+		"""for Openshift proxy compatibility, replace 'HEAD'-Method with 'GET'-Method"""
+		if (not "GET" in self.data) and ("HEAD" in self.data):
+			self.data=self.data.replace("HEAD","GET",1)
+		websocket.WebSocketServerProtocol.processHandshake(self)
+	def onClose(self,wasclean,code,reason):
+		"""called when the connection was closed."""
+		if self.group is not None:
+			self.leave_group()
+	@inlineCallbacks
+	def onMessage(self,msg,is_binary):
+		"""handles a message."""
+		#print "got message: "+repr(msg)
+		if not self.did_handshake:
+			#we do our handshake here
+			if len(msg)!=8:
+				self.sendClose()
 			else:
-				pass
-			try:
-				self.remove_s(s)
-			except:
-				pass
-	def remove_s(self,s):
-		"""removes a socket from the select-loop."""
-		try:
-			cid=self.conns[s]["id"]
-			pid=self.conns[s]["peer"]
-			del self.conns[s]
-			del self.id2s[cid]
-			if pid is not None:
-				self.send_disconnect(pid)
-		except Exception,arg:
-			if DEBUG:
-				raise
-	def send_disconnect(self,cid):
-		"""tells the client cid that its peer disconnected."""
-		s=self.id2s[cid]
-		msg=ID_CTRL+"DISCONNECT"
-		try: s.send(struct.pack("!Q",len(msg))+msg)
-		except Exception,arg:
-			if DEBUG:
-				raise
-		self.conns[s]["peer"]=None
-	def loop(self):
-		"""the mainloop of the server."""
-		assert self.s is not None
-		try:
-			while True:
-				crs=[self.s]+self.conns.keys()
-				cws=[]
-				cxs=crs
-				nrs,nws,nxs=select.select(crs,cws,cxs,None)
-				#handle exceptions
-				if self.s in nxs:
-					raise RuntimeError,"Error in listening socket."
-				for s in nxs:
-					self.remove_s(s)
-					if s in nrs:
-						nrs.remove(s)
-					if s in nws:
-						nws.remove(s)
-				#handle readable sockets
-				#first check for new conns.
-				if self.s in nrs:
-					conn,addr=self.s.accept()
-					self.add_s(conn)
-				#now handle aviable data
-				for s in nrs:
-					try:
-						if s is self.s: continue
-						ldata=recv_exact(s,8)
-						length=struct.unpack("!Q",ldata)[0]
-						data=recv_exact(s,length)
-						if data.startswith(ID_MSG) or data.startswith(ID_PPC):
-							tosend=ldata+data
-							pid=self.conns[s]["peer"]
-							if pid is None:
-								continue
-							peer=self.id2s[pid]
-							peer.send(tosend)
-						elif data.startswith(ID_CTRL):
-							payload=data[1:]
-							if payload=="CLOSE":
-								self.remove_s(s)
-								if s in nws:
-									nws.remove(s)
-								continue
-							elif payload.startswith("CONN "):
-								pid=struct.unpack("!Q",payload[5:13])[0]
-								pswd=payload[13:]
-								if not pid in self.id2s.keys():
-									s.send("F")
-									continue
-								peer=self.id2s[pid]
-								if self.conns[peer]["peer"] is not None:
-									s.send("F")
-									continue
-								if self.conns[peer]["pswd"]!=pswd:
-									s.send("F")
-									continue
-								cid=self.conns[s]["id"]
-								self.conns[peer]["peer"]=cid
-								self.conns[s]["peer"]=pid
-								s.send("T")
-								msg=ID_CTRL+"PAIR "+struct.pack("!Q",cid)
-								tosend=struct.pack("!Q",len(msg))+msg
-								peer.send(tosend)
-								continue
+				pv= yield struct.unpack("!d",msg)[0]
+				if pv!=VERSION:
+					yield self.sendMessage("F",True)
+					yield self.sendClose()
+				else:
+					yield self.sendMessage("T",True)
+					self.did_handshake=True
+		elif not is_binary:
+			pass#we cant do anything here
+		else:
+			idb=msg[0]
+			payload= yield msg[1:]
+			if idb==ID_CTRL:
+				if payload=="LEAVE":
+					if self.group is None:
+						pass
+					else:
+						yield self.leave_group()
+				elif payload.startswith("JOIN"):
+					if self.group is not None:
+						yield self.leave_group()
+					gn,pswd=payload[4:].split("\x00")
+					gn,pswd= yield base64.b64decode(gn),base64.b64decode(pswd)
+					if gn in self.factory.groups.keys():
+						group=self.factory.groups[gn]
+						state=yield group.join(self,pswd)
+						if state is False:
+							yield self.sendMessage(ID_CTRL+"E:NOJOIN",True)
 						else:
-							continue
-					except Exception,arg:
-						if DEBUG:
-							raise
-						self.remove_s(s)
-		finally:
-			if self.s is not None:
-				self.s.close()
-	def run(self,addr):
-		"""runs the server"""
-		self.s=socket.socket(socket.AF_INET,socket.SOCK_STREAM,0)
-		self.s.bind(addr)
-		self.s.listen(1)
-		self.loop()
+							self.group=group
+							self.cid=state
+							yield self.sendMessage(ID_CTRL+"I:JOIN"+chr(self.cid),True)
+					else:
+						yield self.sendMessage(ID_CTRL+"E:NOJOIN",True)
+				elif payload=="DISCONNECT":
+					yield self.leave_group()
+					yield self.sendClose()
+				elif payload.startswith("CREATE"):
+					if self.group is not None:
+						yield self.leave_group()
+					gn,pswd= yield payload[6:].split("\x00")
+					gn,pswd= yield base64.b64decode(gn),base64.b64decode(pswd)
+					if gn in self.factory.groups.keys():
+						yield self.sendMessage(ID_CTRL+"E:NOCREATE",True)
+					else:
+						self.factory.groups[gn]=Group(self.factory,gn,pswd)
+						self.cid= yield self.factory.groups[gn].join(self,pswd)
+						yield self.sendMessage(ID_CTRL+"I:CREATE"+chr(self.cid),True)
+			else:
+				if self.group is None:
+					pass
+				else:
+					who=ord(payload[0])
+					yield self.group.send_to(self.cid,who,idb+payload[1:])
+				
 
+class P22PServerFactory(websocket.WebSocketServerFactory):
+	"""The Factory constructs the protocol and contains shared data"""
+	def __init__(self,*args,**kwargs):
+		nargs=tuple([self]+list(args))
+		kwargs["debug"]=DEBUG
+		kwargs["protocols"]=PROTOCOLS
+		apply(websocket.WebSocketServerFactory.__init__,nargs,kwargs)
+		self.groups={}
+
+
+#single file code
 if __name__=="__main__":
-	import os
-	print "starting server..."
-	HOST=os.getenv("OPENSHIFT_PYTHON_IP","0.0.0.0")
-	PORT=8000
-	server=P22pServer()
-	server.run((HOST,PORT))
+	#setup (with Openshift compatiblity)
+	IP=os.getenv("OPENSHIFT_DIY_IP","0.0.0.0")
+	PORT=int(os.getenv("OPENSHIFT_DIY_PORT",8080))
+	#logging
+	twisted.python.log.startLogging(sys.stdout)
+	#server
+	server=P22PServerFactory()
+	server.protocol=P22PServerProtocol
+	#run
+	reactor=twisted.internet.reactor#this should be a reference, right?
+	reactor.listenTCP(PORT,server,interface=IP)
+	reactor.run()

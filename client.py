@@ -1,435 +1,729 @@
 # coding: utf-8
-"""The p22p client."""
-import socket,select,struct,cmd,hashlib,sys,threading,os,time
+"""the P22P-Client. Also contains a single-file UI."""
+
+import socket,select,struct,hashlib,base64,time,threading,cmd,sys,atexit
+import autobahn.twisted.websocket as websocket
+import twisted.internet
+from twisted.internet import reactor
+from twisted.internet.error import ReactorNotRunning
+try:
+	from twisted.internet import ssl
+except:
+	ssl=None
 
 #constants
-VERSION=0.1
-DEFAULT_SERVER="www.p22p-bennr01.rhcloud.com:8000"
-BUFFERSIZE=8192
-SELECT_TIMEOUT=0.05
+VERSION=0.2
+PROTOCOLS=["P22P-WS-P"]
+USER_AGENT="P22P/{v}".format(v=VERSION)
+DEBUG=("-d" in sys.argv)
+ISETO=0.02
+RECV_BUFF=4096
+
 ID_CTRL="\x01"
-ID_MSG="\x02"
-ID_PPC="\x03"
+ID_PC="\x02"
+ID_MSG="\x03"
 
-def recv_exact(s,nbytes):
-	"""receives exact nbytes from s."""
-	if os.name=="nt":
-		#windows
-		tr=nbytes
-		ret=""
-		while True:
-			data=s.recv(tr)
-			tr-=len(data)
-			ret+=data
-			if tr<=0:
-				return ret
-	else:
-		return s.recv(nbytes,socket.MSG_WAITALL)
+DEFAULT_SERVER="ws://p22p-bennr01.rhcloud.com:8000"
 
-def hash_pswd(pswd):
-	return hashlib.sha384(pswd).digest()
+if DEBUG:
+	from twisted.python import log
+	log.startLogging(sys.stdout)
 
+#Exceptions
 class CommunicationError(IOError):
 	pass
+class ConnectionError(IOError):
+	pass
+class UsageError(Exception):
+	pass
 
-class _FakeLock(object):
-	"""A fake-implementation of threading.Lock, used for testing."""
-	def acquire(self):
-		pass
-	def release(self):
-		pass
-	def locked(self):
-		return False
+#Encryption (uses CBC)
 
-class P22pClient(object):
-	def __init__(self):
-		self.s=None
+def _blockXOR(a,b):
+	#return a xor b
+	if len(a)!=len(b):
+		raise ValueError("expected to strings with same length")
+	res=[]
+	for i in xrange(len(a)):
+		res.append(chr(ord(a[i])^ord(b[i])))
+	return "".join(res)
+def encrypt(plain,key):
+	"""encrypt using CBC."""
+	blocklength=len(key)
+	dl=len(plain)
+	bc=dl/blocklength
+	v=key
+	i=0
+	res=[]
+	while i<bc:
+		start=i*blocklength
+		end=start+blocklength
+		block=plain[start:end]
+		v=_blockXOR(block,v)
+		i+=1
+		res.append(v)
+	rm=dl%blocklength
+	if rm>0:
+		block=plain[-rm:]
+		plain2=_blockXOR(block,v[0:rm])
+		res.append(plain2)
+	return "".join(res)
+def decrypt(chipher,key):
+	"""decrypts using CBC."""
+	blocklength=len(key)
+	dl=len(chipher)
+	bc=dl/blocklength
+	v=key
+	i=0
+	res=[]
+	while i<bc:
+		start=i*blocklength
+		end=start+blocklength
+		block=chipher[start:end]
+		plain=_blockXOR(block,v)
+		v=block
+		i+=1
+		res.append(plain)
+	rm=dl%blocklength
+	if rm>0:
+		block=chipher[-rm:]
+		plain=_blockXOR(block,v[0:rm])
+		res.append(plain)
+	return "".join(res)
+
+#Communication
+
+class P22PClientProtocol(websocket.WebSocketClientProtocol):
+	"""The clientside Communication-Protocol"""
+	def __init__(self,*args,**kwargs):
+		nargs=tuple([self]+list(args))
+		apply(websocket.WebSocketClientProtocol.__init__,nargs,kwargs)
+		self.did_handshake=False
 		self.cid=None
-		self.pid=None
-		self.pswd=None
-		self.connected=False
-		self.ispairer=False
-		self.chid=0
-		self.conns={}
-		self.id2s={}
-		self.pingresult=None
-		self.pingstart=None
-		self.connlock=_FakeLock()#threading.Lock()
-	def get_new_id(self):
-		"""returns a new id for a channel"""
-		if self.ispairer and self.chid%2==0: self.chid+=1#ensure ids are unique
-		n=self.chid
-		self.chid+=2
-		return n
-	def connect(self,addr):
-		"""connects the client to a p22p-server"""
-		assert not self.connected,"already conncted!"
-		assert self.s is None,"already connected!"
-		assert self.pswd is not None,"Password not set!"
-		self.s=socket.create_connection(addr,10)
-		self.s.settimeout(10)
-		self.s.send(struct.pack("!d",VERSION))
-		answ=recv_exact(self.s,1)
-		if answ!="T":
-			try: self.s.close()
-			except: pass
-			raise CommunicationError,"Version Mismatch!"
-		idd=recv_exact(self.s,8)
-		self.cid=struct.unpack("!Q",idd)[0]
-		hp=hash_pswd(self.pswd)
-		ld=struct.pack("!Q",len(hp))
-		self.s.send(ld+hp)
-		self.s.settimeout(None)
-		self.connected=True
-		self.run()
-	def _dispatch(self,idb,msg):
-		"""sends a message msg of type idb to server"""
-		assert self.connected,"not connected!"
-		tosend=idb+msg
-		length=len(tosend)
-		packed=struct.pack("!Q",length)
-		self.s.send(packed+tosend)
-	def on_disconnect(self):
-		"""called on disconnect (either peer or server)"""
-		for s in self.conns.keys():
-			try: s.close()
-			except: pass
-		#self.connlock.acquire()
-		self.conns={}
-		self.id2s={}
-		self.chid=0
-		self.pid=None
-		self.ispairer=False
-		#self.connlock.release()
-	def pair(self,pid,pswd):
-		"""pairs with peer pid."""
-		assert self.connected,"not connected!"
-		assert self.pid is None,"already paired!"
-		hp=hash_pswd(pswd)
-		self._dispatch(ID_CTRL,"CONN "+struct.pack("!Q",pid)+hp)
-		answ=recv_exact(self.s,1)
-		if answ!="T":
-			return False
-		self.pid=pid
-		self.ispairer=True
-		return True
-	def disconnect(self):
-		"""disconnects from server"""
-		self._dispatch(ID_CTRL,"CLOSE")
+		self.joinstate=0#0=Not joining, 1=waiting, 2=Success, 3=Fail
+		self.createstate=0#0=Not creating, 1=waiting, 2=Success, 3=Fail
+		self.pingstates={}
+		self.ai2s={}#map ai to s (ai=Adress info)
+		self.ls={}#list of listening sockets
+		self.s2ai={}#map sockets to ai
+		self.s2i={}#map sockets to info
+		self.AL=threading.Lock()
+		reactor.callInThread(self.__loop)#use deffereds instead?
+	def clientConnectionFailed(self,connector,reason):
+		"""called when the connection failed."""
+		if DEBUG:
+			sys.stdout.write("Connection failed: reason: '{r}'.\n".format(r=reason))
+		websocket.WebSocketClientProtocol.clientConnectionFailed(self,connector,reason)
+		self.factory.root._connect_failed()
+		#raise CommunicationError,"WS-Error during Connect: {r}!".format(r=reason)
+	def onConnect(self,response):
+		"""called when connection was established."""
+		if DEBUG:
+			sys.stdout.write("Connection established. Response: '{r}'.\n".format(r=response))
+		self.factory.root.client=self#we need to tell the client-object that  this is the connection
+	def onOpen(self):
+		"""called when the connection was established and ws-handshake finished."""
+		if DEBUG:
+			sys.stdout.write("Initiating Handshake...\n")
+		self.sendMessage(struct.pack("!d",VERSION),True)
+	def onClose(self,wasclean,code,reason):
+		"""called when an error occcures."""
+		if DEBUG:
+			sys.stdout.write("Connection closed.\n")
+		if not wasclean:
+			raise CommunicationError("WS-Error {n}: {r}!".format(n=code,r=reason))
+	def onMessage(self,msg,isBinary):
+		"""called when a message is received."""
+		if DEBUG:
+			sys.stdout.write("Got {t}binary Message: '{m}'.\n".format(m=msg,t="" if isBinary else "non"))
+		if not isBinary:
+			raise CommunicationError("Received non-binary Message: '{m}'!'".format(m=msg))
+			return
+		if not self.did_handshake:
+			if len(msg)!=1:
+				raise CommunicationError("Error during Handshake: Expected 1 Byte, got {n} Bytes!".format(n=len(msg)))
+			if msg=="T":
+				self.did_handshake=True
+				return
+			elif msg=="F":
+				raise CommunicationError("Version Mismatch!")
+			else:
+				raise CommunicationError("Error during Handshake: Regeived Invalid Answer: '{a}'!".format(a=msg))
+		idb=msg[0]
+		payload=msg[1:]
+		if idb==ID_CTRL:
+			if payload.startswith("I:JOIN") and len(payload)==7:
+				self.cid=ord(payload[-1])
+				self.joinstate=2
+			elif payload=="E:NOJOIN":
+				self.joinstate=3
+			elif payload.startswith("I:CREATE") and len(payload)==9:
+				self.cid=ord(payload[-1])
+				self.createstate=2
+			elif payload=="E:NOCREATE":
+				self.createstate=3
+			elif payload.startswith("LEAVE") and len(payload)==6:
+				pid=ord(payload[-1])
+				self.AL.acquire()
+				for s in self.ls.keys():
+					if self.ls[s]["peer"]==pid:
+						self._close_s(s)
+				for s in self.s2i.keys():
+					i=self.s2i[s]
+					if i["peer"]==pid:
+						port=i["local"]
+						self._close_s(s)
+				self.AL.release()
+		elif idb==ID_PC:
+			sender,payload=ord(payload[0]),payload[1:]
+			if payload=="PING":
+				self.send_to(sender,ID_PC+"PINGANSW")
+			elif payload=="PINGANSW":
+				ct=time.time()
+				if sender not in self.pingstates.keys():
+					return
+				else:
+					st=self.pingstates[sender][1]
+					res=ct-st
+					self.pingstates[sender]=(True,res)
+			elif payload.startswith("BRIDGE") and len(payload)==10:
+				lp,pp=struct.unpack("!HH",payload[6:])
+				ai=(sender,pp)
+				try:
+					s=socket.socket()
+					s.connect(("localhost",lp))
+					self.AL.acquire()
+					self.s2i[s]={"socket":s,"recv":0,"send":0,"peer":sender,"local":pp,"port":lp,"creator":sender}
+					self.s2ai[s]=ai
+					self.ai2s[ai]=s
+					self.AL.release()
+				except:
+					self._close_s(s)
+			elif payload.startswith("CLOSE") and len(payload)==8:
+				c=payload[5]
+				lp=struct.unpack("!H",payload[6:])[0]
+				ai=(c,lp)
+				self.AL.acquire()
+				s=self.ai2s[ai]
+				self._close_s(s,send_close=False)
+				self.AL.release()
+		elif idb==ID_MSG:
+			sender,creator,pi,payload=ord(payload[0]),ord(payload[1]),payload[2:4],payload[4:]
+			lp=struct.unpack("!H",pi)[0]
+			ai=(creator,lp)
+			tosend=decrypt(payload,self.__key)
+			length=len(tosend)
+			self.AL.acquire()
+			s=self.ai2s[ai]
+			self.s2i[s]["recv"]+=length
+			self.AL.release()
+			try:
+				s.send(tosend)
+			except:
+				self.AL.acquire()
+				self._close_s(s)
+				self.AL.release()
+		else:
+			raise CommunicationError("Received Message with invalid ID '{i}'!".format(i=idb))
+	def __loop(self):
+		"""the internal socket event loop."""
+		while True:
+			self.AL.acquire()
+			tr=self.ls.keys()+self.s2ai.keys()
+			tw=[]
+			tcx=tr
+			self.AL.release()#other threads may modifiy this while we wait
+			if len(tr+tw+tcx)==0:
+				#acording to docs, three empty lists are platform dependant.
+				#better not wait with empty lists.
+				time.sleep(ISETO)#dont waste resources in a while-true-pass-loop
+				continue
+			ra,wa,xs=select.select(tr,tw,tcx,ISETO)#timeout so we can check for new sockets to read from
+			self.AL.acquire()
+			for s in xs:
+				if s in ra:
+					ra.remove(s)
+					info=self.s2i[s]
+				if s in wa:
+					wa.remove(s)
+				self._close_s(s)
+			for s in ra:
+				if s in self.ls.keys():
+					#new connection
+					c,a=s.accept()
+					self.ls[s]["got"]+=1
+					port=self.ls[s]["port"]
+					lp=c.getsockname()[1]
+					peer=self.ls[s]["peer"]
+					ai=(self.cid,lp)
+					self.ai2s[ai]=c
+					self.s2ai[c]=ai
+					self.s2i[c]={"ai":ai,"recv":0,"send":0,"local":lp,"creator":self.cid,"peer":peer,"socket":c,"port":port}
+					self.send_to(peer,ID_PC+"BRIDGE"+struct.pack("!HH",port,lp))
+				if s in self.s2ai.keys():
+					ai=self.s2ai[s]
+					data=s.recv(RECV_BUFF)
+					self.s2i[s]["send"]+=len(data)
+					info=self.s2i[s]
+					if len(data)==0:
+						self._close_s(s)
+						continue
+					pi=struct.pack("!H",ai[1])
+					tosend=encrypt(data,self.__key)
+					self.send_to(info["peer"],ID_MSG+chr(ai[0])+pi+tosend)
+			for s in wa:
+				pass
+			self.AL.release()
+	def __send_close(self,ai):
+		"""tells peer that conn on port was closed."""
+		peer=self.s2i[self.ai2s[ai]]
+		self.send_to(peer,ID_PC+"CLOSE"+chr(ai[0])+struct.pack("!H",ai[1]))
+	def _close_s(self,s,send_close=True):
+		"""closes a socket. Does not acquire intern lock."""
 		try:
-			self.s.close()
+			if s in self.ls.keys():
+				del self.ls[s]
+			if s in self.s2ai.keys():
+				ai=self.s2ai[s]
+				if send_close:
+					self.__send_close(ai)
+				del self.s2ai[s]
+				if ai in self.ai2s.keys():
+					del self.ai2s[ai]
+			if s in self.s2i.keys():
+				del self.s2i[s]
 		except:
 			pass
-		self.s=None
-		self.pswd=None
-		self.on_disconnect()
-		self.connected=False
-	def loop(self):
-		assert self.connected,"not connected!"
-		try:
-			while self.connected:
-				self.connlock.acquire()
-				trs=[self.s]+self.conns.keys()
-				self.connlock.release()#release while waiting on select.select
-				tws=[]
-				txs=trs
-				nrs,nws,nxs=select.select(trs,tws,txs,SELECT_TIMEOUT)
-				self.connlock.acquire()
-				for s in nxs:
-					if s is self.s:
-						self.on_disconnect()
-						raise CommunicationError,"Error in server-connection."
-					if s in nrs:
-						nrs.remove(s)
-					if s in nws:
-						nws.remove(s)
-					if self.conns[s]["type"]=="c":
-						chid=self.conns[s]["id"]
-						del self.id2s[chid]
-						self._dispatch(ID_PPC,"CLOSE "+struct.pack("!Q",chid))
-					try:
-						s.close()
-					except: pass
-					del self.conns[s]
-				for s in nrs:
-					if s is self.s:
-						ldata=recv_exact(self.s,8)
-						length=struct.unpack("!Q",ldata)[0]
-						data=recv_exact(self.s,length)
-						idb=data[0]
-						payload=data[1:]
-						if idb==ID_CTRL:
-							if payload=="DISCONNECT":
-								self.on_disconnect()
-								nws=[]
-								break
-							elif payload.startswith("PAIR "):
-								self.pid=struct.unpack("!Q",payload[5:])[0]
-							else:
-								pass
-						elif idb==ID_PPC:
-							if payload.startswith("BRIDGE "):
-								packed=payload[7:]
-								chid,port=struct.unpack("!QQ",packed)
-								s=socket.socket()
-								try:
-									s.connect(("localhost",port))
-									s.settimeout(None)
-									self.id2s[chid]=s
-									localport=s.getsockname()[1]
-									self.conns[s]={"id":chid,"type":"c","send":0,"recv":0,"target":localport}
-								except:
-									self._dispatch(ID_PPC,"CLOSE "+struct.pack("!Q",chid))
-							elif payload.startswith("CLOSE "):
-								chid=struct.unpack("!Q",payload[6:])[0]
-								s=self.id2s[chid]
-								del self.conns[s]
-								del self.id2s[chid]
-								s.close()
-							elif payload=="PING":
-								self._dispatch(ID_PPC,"PINGANSW")
-							elif payload=="PINGANSW":
-								if self.pingstart is not None:
-									self.pingresult=time.time()-self.pingstart
-							else:
-								pass
-						elif idb==ID_MSG:
-							chid=struct.unpack("!Q",payload[:8])[0]
-							msg=payload[8:]
-							if chid not in self.id2s.keys():
-								continue
-							local=self.id2s[chid]
-							local.send(msg)
-							self.conns[local]["recv"]+=len(msg)
-						else:
-							pass
-					else:
-						if self.conns[s]["type"]=="c":
-							chid=self.conns[s]["id"]
-							data=s.recv(BUFFERSIZE)#NO FLAGS HERE. Maybe add timeout and send nothing if exceeded?
-							if len(data)==0:
-								#close this sockets
-								if s in nws:
-									nws.remove(s)
-									chid=self.self.conns[s]
-									del self.id2s[chid]
-									del self.conns[s]
-									try:
-										s.close()
-									except:
-										pass
-									self._dispatch(ID_PPC,"CLOSE "+struct.pack("!Q",chid))
-									continue
-							self._dispatch(ID_MSG,struct.pack("!Q",chid)+data)
-							self.conns[s]["send"]+=len(data)
-						else:
-							new,addr=s.accept()
-							new.settimeout(None)
-							self.conns[s]["got"]+=1
-							chid=self.get_new_id()
-							port=self.conns[s]["port"]
-							self.conns[new]={"id":chid,"type":"c","target":port,"recv":0,"send":0}
-							self.id2s[chid]=new
-							self._dispatch(ID_PPC,"BRIDGE "+struct.pack("!QQ",chid,port))
-				for s in nws:
-					pass
-				self.connlock.release()
-		except Exception,arg:
-			#silently ignore errors after disconnect
-			if self.connected:
-				raise
 		finally:
-			try:
-				self.s.close()
-				self.on_disconnect()
+			try: s.close()
 			except:
 				pass
-			self.connected=False
-	def relay_port(self,port):
-		"""relays port as server. returns the port opened localy"""
-		s=socket.socket()
-		s.bind(("localhost",0))
-		lp=s.getsockname()[1]
-		s.listen(1)
-		self.connlock.acquire()
-		self.conns[s]={"type":"l","port":port,"got":0}
-		self.connlock.release()
-		return lp
-	def close(self):
-		"""closes the server"""
-		self.disconnect()
-	def run(self):
-		"""starts the background thread."""
-		assert self.connected,"not connected!"
-		thr=threading.Thread(name="p22p Relay-Thread",target=self.loop)
-		thr.daemon=True
-		thr.start()
-	def get_info(self):
-		"""returns a list of tuples of (ID,type,port,target)"""
-		ret=[]
-		self.connlock.acquire()
-		for s in self.conns.keys():
-			if s is self.s:
-				continue
-			info=self.conns[s]
-			if info["type"]=="l":
-				ty="L2R"
-				port=s.getsockname()[1]
-				target=info["port"]
-				ID=None
-				send=None
-				recv=info["got"]
-			else:
-				ty="R2L"
-				port=s.getpeername()[1]
-				target=info["target"]
-				ID=info["id"]
-				send=info["send"]
-				recv=info["recv"]
-			ret.append((ID,ty,port,target,recv,send))
-		self.connlock.release()
+	def send_to(self,target,msg):
+		"""sends a message to groupmember target"""
+		if self.cid is None:
+			raise UsageError("Not in a group!")
+		idb,payload=msg[0],msg[1:]
+		self.sendMessage(idb+chr(target)+payload,True)
+	def disconnect(self):
+		"""disconnects from the server."""
+		if not self.did_handshake:
+			raise UsageError("Not connected!")
+		self.sendMessage(ID_CTRL+"DISCONNECT",True)
+		self.cid=None
+		self.did_handshake=False
+		self.joinstate=0
+		self.createstate=0
+		self.sendClose()
+	def create_group(self,name,pswd):
+		"""creates and joins a group. returns True if it was created, otherwise False"""
+		if not self.did_handshake:
+			return False
+		hpo=hashlib.sha256(name)
+		hp=hpo.digest()
+		tosend="\x00".join([base64.b64encode(e) for e in (name,pswd)])
+		self.sendMessage(ID_CTRL+"CREATE"+tosend,True)
+		self.createstate=1
+		while self.createstate==1:
+			pass
+		if self.createstate==2:
+			self.createstate=0
+			self.__key=pswd
+			return True
+		else:
+			self.createstate=0
+			return False
+	def join_group(self,name,pswd):
+		"""joins a group"""
+		hpo=hashlib.sha256(name)
+		hp=hpo.digest()
+		tosend="\x00".join([base64.b64encode(e) for e in (name,pswd)])
+		self.sendMessage(ID_CTRL+"JOIN"+tosend,True)
+		self.joinstate=1
+		while self.joinstate==1:
+			pass
+		if self.joinstate==2:
+			self.joinstate=0
+			self.__key=pswd
+			return True
+		else:
+			self.joinstate=0
+			return False
+	def leave_group(self):
+		"""leaves the current group."""
+		self.sendMessage(ID_CTRL+"LEAVE",True)
+		self.joinstate=0
+		self.createstate=0
+		self.__key=None
+	def ping(self,target):
+		"""pings the target group member."""
+		if not self.did_handshake:
+			raise UsageError("Not connected!")
+		if self.cid is None:
+			raise UsageError("Not in a Group!")
+		self.pingstates[target]=(False,time.time())
+		self.send_to(target,ID_PC+"PING")
+		while not self.pingstates[target][0]:
+			pass
+		ret=self.pingstates[target][1]
+		del self.pingstates[target]
 		return ret
-	def ping(self):
-		"""sends a ping-message and wait for its answer. returns time passed is seconds."""
-		self.pingresult=None
-		self.pingstart=time.time()
-		self._dispatch(ID_PPC,"PING")
-		while self.pingresult is None:
-			time.sleep(0.1)
-		self.pingstart=None
-		return self.pingresult
+	def relay_port(self,pid,remote,local=0):
+		"""relay port local to port remote on peer pid. A socket can connect to the local port and the communication will be relayed to remote.
+		returns the port used localy"""
+		if not self.did_handshake:
+			raise UsageError("Not connected!")
+		if self.cid is None:
+			raise UsageError("Not in a Group!")
+		s=socket.socket()
+		try:
+			s.bind(("localhost",local))
+			port=s.getsockname()[1]
+			s.listen(1)
+			self.AL.acquire()
+			self.ls[s]={"peer":pid,"port":remote,"got":0,"local":port}
+			self.AL.release()
+			return port
+		except:
+			if self.AL.locked():
+				self.AL.release()
+			s.close()
+			raise
+	def list_conns(self):
+		"""
+returns a list of the current relayed ports.
+Each list element has the structure (type,from,localport,to,peerport,recv,send).
+type: a string
+from: 'LOCAL' or int
+localport: int
+to: 'LOCAL' or int
+peerport: int
+recv: int
+send: int or None
+"""
+		res=[]
+		self.AL.acquire()
+		for ls in self.ls.keys():
+			info=self.ls[ls]
+			res.append(("Relay","LOCAL",info["local"],info["peer"],info["port"],info["got"],None))
+		for s in self.s2i.keys():
+			info=self.s2i[s]
+			if info["creator"]==self.cid:
+				fai="LOCAL"
+				tai=info["peer"]
+			else:
+				fai=info["creator"]
+				tai=info["peer"]
+			res.append(("Conn",fai,info["local"],tai,info["port"],info["recv"],info["send"]))
+		self.AL.release()
+		return res
 
-#========================================================================
+class P22PClientFactory(websocket.WebSocketClientFactory):
+	"""The Factory for the P22P-Client"""
+	def __init__(self,root,url):
+		websocket.WebSocketClientFactory.__init__(self,url=url,protocols=PROTOCOLS,useragent=USER_AGENT,debug=DEBUG)
+		self.protocol=P22PClientProtocol
+		self.root=root
 
-class Console(cmd.Cmd):
-	"""A controll console. Used in single-file mode"""
+#Client object
+
+class P22PClient(object):
+	"""The P22P-Client."""
+	def __init__(self,root,reactor=reactor):
+		self.root=root
+		self.factory=None
+		self.client=None
+		self.reactor=reactor#keep a reference if we ever change the reactor
+	def connect(self,addr):
+		"""connects to target server"""
+		if self.client is not None:
+			if self.client.did_handshake:
+				raise UsageError("Already Connected!")
+		try:
+			self.factory=P22PClientFactory(self,addr)
+			if self.factory.isSecure and (ssl is not None):
+				context=ssl.ClientContextFactory()
+			else:
+				context=None
+			#self.reactor.connectTCP(ip,port,self.factory,timeout=10)
+			websocket.connectWS(self.factory,context,timeout=10)
+			while self.client is None:
+				#wait for self.client to be set
+				pass
+			if self.client is False:
+				self.client=None
+				raise ConnectionError("Cant connect to Server!")
+		except:
+			self.factory=None
+			self.client=None
+			raise
+	def _connect_failed(self):
+		"""called when the connection failed."""
+		self.root.stdout.write("Error: Connection Failed!\n")
+		self.client=False
+	def disconnect(self):
+		"""disconnects from server."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		self.client.disconnect()
+		self.client=None
+		self.factory=None
+	close=disconnect#alias for disconnect
+	def create(self,name,pswd):
+		"""Creates a Group."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.create_group(name,pswd)
+	def join(self,name,pswd):
+		"""Joins a Group."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.join_group(name,pswd)
+	def leave(self):
+		"""Leaves the Group."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.leave_group()
+	def ping(self,target):
+		"""pings target peer"""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.ping(target)
+	def get_cid(self):
+		"""returns the cid of this client."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.cid
+	def relay(self,pid,remote,local=0):
+		"""relays LOCAL to REMOTE@PID. Note that LOCAL is the port the local socket connects to and REMOTE the port where the server/host is running."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.relay_port(pid,remote,local)
+	def list(self):
+		"""returns a list of tuples each representing a connection or relay."""
+		if self.client is None:
+			raise UsageError("Not connected!")
+		return self.client.list_conns()
+
+#Single-File User Interface
+
+class P22PClientConsole(cmd.Cmd):
+	"""A text-userinterface."""
 	prompt="(p22p)"
 	intro="p22p-Client v{v} For help, type 'help' or '?'.".format(v=VERSION)
 	use_rawinput=True
-	client=P22pClient()
-	def help_security(self):
-		"""prints help about the security."""
-		print """SECURITY
-================
-While p22p doesnt allow execution of code on your machine, all socket-
-connections are done as localhost.
-This means:
-	-they may pass-by your firewall
-	-some programs only accepts local requests to improve security. This wont work with p22p-request
-Some other security-problems are:
-	-no explicit port enabling: your peer can connect to any of your open ports, including (if any) active shells.
-	-no notification about beeing paired.
-"""
+	def __init__(self,reactor=reactor):
+		cmd.Cmd.__init__(self)
+		self.reactor=reactor
+		self.client=P22PClient(self,reactor)
+		self.ingroup=False
 	def do_connect(self,cmd):
-		"""connect PSWD [IP:PORT]: connects to target central server."""
-		if self.client.connected:
-			print "Already connected! Use disconnect to disconnect"
+		"""connect [ADDRESS:PORT]: Connects to target server. If no address nor port are given, connect to default server."""
+		if self.client.client is not None:
+			self.stdout.write("Already connected!\n")
 			return
+		if cmd.count("://")>1:
+			self.stdout.write("Invalid Argument!\n")
+		if len(cmd)==0:
+			target=DEFAULT_SERVER
+		else:
+			target=cmd
 		try:
-			data=cmd.split(" ")
-			if len(data)==1:
-				pswd=data
-				cmd=DEFAULT_SERVER
-			elif len(data)==2:
-				pswd,cmd=data
-			else:
-				raise Exception,"This will cause the except-clausel to be executed"
-		except:
-			print "Invalid Argument!"
-			return
-		self.client.pswd=pswd
-		try: ip,port=cmd.split(":")
-		except:
-			print "Invalid argument!"
-			return
-		print "Connecting..."
-		try:
-			self.client.connect((ip,port))
+			self.stdout.write("Connecting to '{a}'...\n".format(a=target))
+			self.client.connect(target)
+			self.stdout.write("Connected.\n")
 		except Exception,arg:
-			print "Connection failed! Reason: {a}".format(a=arg)
-			return
-		print "Connected. Your CID is {i}.".format(i=self.client.cid)
+			self.stdout.write("Error: {e}\n".format(e=arg))
 	def do_disconnect(self,cmd):
-		"""disconnect: disconnects from the central server."""
-		if not self.client.connected:
-			print "Not connected!"
+		"""disconnect: disconnects from server."""
+		if self.client.client is None:
+			self.stdout.write("Error: Not connected.\n")
 			return
-		self.client.close()
-		print "Disconnected."
-	def do_exit(self,cmd):
-		"""exit: exits the script, disconnecting if required."""
-		if self.client.connected:
-			self.client.close()
-		sys.exit(0)
-	def do_list(self,cmd):
-		"""list: lists all connections and relayed ports."""
-		if self.client.pid is None:
-			print "Not connected/paired!"
+		self.client.disconnect()
+		self.ingroup=False
+	def do_create(self,cmd):
+		"""create GROUP PSWD: creates and joins a group."""
+		if self.ingroup:
+			self.stdout.write("Error: Already in a Group!\n")
 			return
-		info=self.client.get_info()
-		print "Connections and relayed ports"
-		print "|   ID   |  Type  | Local  | Remote |  Recv  |  Sent  |"
-		print "+--------+--------+--------+--------+--------+--------+"
-		for t in info:
-			print "|"+("{:<8}|"*6).format(*t)
-		#for i in info:
-		#	print " | ".join([str(e) for e in i])
-	def do_relay(self,cmd):
-		"""relay PORT: relays a port to peer."""
 		try:
-			port=int(cmd)
+			name,pswd=cmd.split(" ")
 		except:
-			print "Invalid/Missing Argument!"
-			return
-		if self.client.pid is None:
-			print "Not connected/paired!"
-			return
-		print "Initiating relaying..."
-		try:
-			np=self.client.relay_port(port)
-		except Exception,arg:
-			print "Failed to relay to peer Port {p}! Reason: {a}".format(p=port,a=arg)
-			return
-		print "Now relaying {local} to {target}.".format(local=np,target=port)
-	def do_pair(self,cmd):
-		"""pair PEER PSWD: pairs the client with target peer. PSWD must be the pswd of the other client."""
-		if not self.client.connected:
-			print "Not connected!"
-			return
-		if self.client.pid is not None:
-			print "Already paired!"
+			self.stdout.write("Error: Invalid Argument!\n")
+		s=self.client.create(name,pswd)
+		if s:
+			self.stdout.write("Group created and joined.\n")
+			self.ingroup=True
+			self.stdout.write("Your CID is {i}.\n".format(i=self.client.get_cid()))
+		else:
+			self.stdout.write("Error: Cant create Group!\n")
+	def do_join(self,cmd):
+		"""join GROUP PSWD: joins a group."""
+		if self.ingroup:
+			self.stdout.write("Error: Already in a Group!\n")
 			return
 		try:
-			pid,pswd=cmd.split(" ")
-			pid=int(pid)
+			name,pswd=cmd.split(" ")
 		except:
-			print "Invalid/missing Argument!"
+			self.stdout.write("Error: Invalid Argument!\n")
 			return
-		print "Pairing..."
-		state=self.client.pair(pid,pswd)
-		if state:
-			print "Paired!"
+		s=self.client.join(name,pswd)
+		if s:
+			self.stdout.write("Group joined.\n")
+			self.ingroup=True
+			self.stdout.write("Your CID is {i}.\n".format(i=self.client.get_cid()))
 		else:
-			print "Pairing failed!"
-	def do_id(self,cmd):
-		"""id: prints your own CID and the CID of your Peer."""
-		if not self.client.connected:
-			print "Not connected!"
+			self.stdout.write("Error: Cant join Group!\n")
+	def do_leave(self,cmd):
+		"""leave: leaves the group."""
+		if not self.ingroup:
+			self.stdout.write("Error: Not in a Group!\n")
 			return
-		if self.client.pid is not None:
-			m="The CID of your peer is {n}.".format(n=self.client.pid)
-		else:
-			m=""
-		print "Your CID is {i}. {m}".format(i=self.client.cid,m=m)
-	do_CID=do_ID=do_get_id=do_id
+		self.client.leave()
+		self.ingroup=False
 	def do_ping(self,cmd):
-		"""ping: pings your peer (not the server!)."""
-		if self.client.pid is None:
-			print "Not connected/paired!"
+		"""ping CID: pings groupmember with specified CID"""
+		if not self.ingroup:
+			self.stdout.write("Error: Not in a Group!\n")
 			return
-		print "Pinging..."
-		res=self.client.ping()
-		print "Ping is {p} seconds.".format(p=res)
+		try:
+			cid=int(cmd)
+		except:
+			self.stdout.write("Error: Invalid Argument!\n")
+			return
+		self.stdout.write("Pinging...\n")
+		ping=self.client.ping(cid)
+		self.stdout.write("Ping to target is {p} seconds.\n".format(p=ping))
+	def do_exit(self,cmd):
+		"""exit: exits the program and fieconnrcts if required."""
+		if self.client.client is not None:
+			self.client.disconnect()
+		self.reactor.callFromThread(self.reactor.stop)
+	do_close=do_EOF=do_exit
+	def do_cid(self,cmd):
+		"""cid: shows the CID of this client."""
+		if self.client.client is None:
+			self.stdout.write("Error: Not connected!\n")
+			return
+		cid=self.client.get_cid()
+		if cid is None or not self.ingroup:
+			self.stdout.write("Error: Not in a group!\n")
+			return
+		self.stdout.write("Your CID is {i}.\n".format(i=cid))
+	do_CID=do_ID=do_id=do_get_id=do_cid
+	def do_relay(self,cmd):
+		"""relay PEER [LOCAL] REMOTE: relay connections to localhost:LOCAL to port REMOTE on PEER. if LOCAL is 0 or ommitted, a free port is used."""
+		if self.client.client is None:
+			self.stdout.write("Error: Not connected!\n")
+			return
+		if not self.ingroup:
+			self.stdout.write("Error: Not in a group!\n")
+			return
+		sc=cmd.split(" ")
+		try:
+			peer=int(sc[0])
+			if peer<0 or peer>255:
+				raise Exception("See the except handler")
+			if len(sc)==2:
+				remote=int(sc[1])
+				local=0
+			elif len(sc)==3:
+				local=int(sc[1])
+				remote=int(sc[2])
+			else:
+				raise Exception("This will call the except handler.")
+		except:
+			self.stdout.write("Error: Invalid Argument or invalid number of arguments!\n")
+			return
+		p=self.client.relay(peer,remote,local)
+		self.stdout.write("Now relaying port {l} to {r}.\n".format(l=p,r=remote))
+	def do_list(self,cmd):
+		"""shows all active connections and all relayed ports."""
+		if self.client.client is None:
+			self.stdout.write("Error: Not connected!\n")
+			return
+		if not self.ingroup:
+			self.stdout.write("Error: Not in a group!\n")
+			return
+		stats=self.client.list()
+		self.stdout.write("  Type   |From Pid |From Port| To Pid  | To Port |  Recv   |  Send   \n")
+		self.stdout.write("---------+"*6+"---------\n")
+		for l in stats:
+			text=(("{:>9}|"*7)[:-1]).format(*l).replace("None","----")
+			self.stdout.write(text+"\n")
+		self.stdout.write("\n")
+	def help_usage(self):
+		"""shows a text how to use p22p."""
+		helptext="""
+USAGE
+==========
+1.) connect to server:
+	When starting p22p, you dont automatically connect to a server.
+	To do this, use the 'connect'-command.
+	Without additional arguements, p22p will connect to {default}.
+	If you want to connect to a other server, use the following syntax:
+		connect PROTO://SERVER:PORT
+	where PROTO is either 'ws' or 'wss'. 'wss' is a SSL/TLS connection, ws a insecure connection.
+	Note that the communication between to clients is always CBC-encrypted (additionaly to other encryption methods.)
+	The CBC-password will never be sent to the server.
+	The Server only receives a hash of the password.
 
+2.) join or create a Group
+	p22p is using Group as Network-Namespaces.
+	Each Groupmember has a unique CID. However, the CID is only unique in the Group and only unique during that clients connection.
+	To create a new Group, use the 'create'-command:
+		create NAME PASSWORD
+	The server only receives a hash of the PASSWORD.
+	When creating a Group, you will automatically join that Group.
+	
+	To join a Group, use the 'join'-command:
+		join NAME PSWD
+	The Server only reveives a hash of the Password.
+
+3.) relay a Port
+	To relay a port from your Device to a target device, use the 'relay'-command:
+		relay PEER [LOCAL] REMOTE
+	If LOCAL is 0 or ommited, a free port is choosen.
+	This Command will create a socket listening to Port LOCAL on your DEVICE.
+	Once a connection is made to that Port, P22P will send a message to PEER, telling him to create a connection to Port REMOTE.
+	All data sent trough this connection will be encrypted with the Group's Password.
+	The Server only knows the hash of the password, meaning only Groupmembers know how to decrypt the Message.
+	The Server knows who should receive this message and sends it to only that Client.
+
+4.) Leaving a Group
+	Once you are finished, you can leave the Group.
+	This will close all connections to peers and free your CID.
+	All Groupmembers will receive a message that you left the Group.
+	to leave a Group, use thr 'leave'-command.
+
+5.) Disconnecting
+	If you want to disconnect from the Server, use the 'disconnect'-command.
+	This will close all connections and also auto-leaves the Group (see 4.)
+
+6.) Exiting
+	To close this script, use the 'exit'-command.
+	If required, the 'disconnect'-command is invoked.
+
+7.) Additional commands
+	To get a list of all aviable commands, use the 'help'-command.
+	To get a description about a command, use the gollowing syntax:
+		help COMMAND
+	Here are some useful commands:
+		ping PEER: pings the peer (not the Server.)
+		list: shows a list of all connections and relayed ports. also shows some information.
+		cid: shows your current CID.
+""".format(default=DEFAULT_SERVER)
+		self.stdout.write(helptext)
+
+def _stop():
+	"""stops the reactor."""
+	try:
+		reactor.stop()
+	except ReactorNotRunning,arg:
+		pass
+		
 if __name__=="__main__":
-	Console().cmdloop()
+	cmdo=P22PClientConsole(reactor)
+	atexit.register(_stop)
+	reactor.callInThread(cmdo.cmdloop)
+	reactor.addSystemEventTrigger("after","shutdown",sys.exit,(0,))
+	reactor.run()

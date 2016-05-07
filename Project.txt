@@ -1,1 +1,3 @@
 p22p - Peer2PeerProxy
+
+v0.2 tries to switch over to websockets
