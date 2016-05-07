@@ -1,5 +1,7 @@
 # p22p
 Relay data between two clients using a central server.
+This is usefull if you want two programs to communicate, which would normally be blocked by a firewall of a router/proxy.
+For example, if you want to play a Game with a friend, but the firewall of your/your friends router would block incomming connections, you could both use p22p to connect to the central server and bypass the restriction (both connections would be outgoing). This only works if your router/proxy allows outgoing connections.
 
 #Features
 - Relay any number of socket-connections using one connection
@@ -7,13 +9,14 @@ Relay data between two clients using a central server.
 - clients have a default server configured (ws://p22p-bennr01.rhcloud.com/)
 - old pure-socket version aviable
 - create any number of password protected groups with up to 256 clients
-- communication between groups encrypted with group password (=server cant read data, he only has a hashed version of the pswd)
+- communication between groupmembers encrypted with group password (=server cant read data, he only has a hashed version of the pswd)
 - command-line-interface (command-line arguments and command-loop)
 - asynchronous (=highly scaleable, no thread-overhead)
 - create reserved groups (clients get json-data required to create a group)
 - reserved groups can be configured to only allow data exchange between group-creator and the other clients (no connection between other clients allowed)
 - pypy compatible (=higher performance)
 - buitin help
+- designed for TCP
 
 #Requirements
 P22P requires python 2.7.X (not tested with 3.X.X).
