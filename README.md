@@ -19,12 +19,26 @@ For example, if you want to play a Game with a friend, but the firewall of your/
 - designed for TCP
 
 #Requirements
-P22P requires python 2.7.X (not tested with 3.X.X).
+P22P requires python 2.7.X (not tested with 3.X.X). Get it here: https://www.python.org/downloads/release/python-2711/
 P22P requires the following packages from pypi:
 - twisted
 - autobahn
 
 You can install these requirements by running `pip -r requirements.txt`.
+If you dont have pip installed, see https://pip.pypa.io/en/latest/installing/ for a tutorial on installing pip.
+
+#Installation
+1. Install requirements. See *Requirements* for more informations.
+2. Download `client.py` (or all files in this repo). You can also just copy and paste the content of  https://raw.githubusercontent.com/bennr01/p22p/v0.3/client.py
+3. Finished
+
+#Launching P22P
+1. Open a Console/Shell
+   - **Windows:** Press `Windows`and `r` at the same time, then type `cmd` and press enter.
+   - **Linux:** If you are a linux user, you probably already know how to open a shell.
+2. Start P22P:
+   - Type `python <PATH-TO-YOUR-CLIENT.PY-FILE>` (insert the path to the `client.py` file there)
+3. Done
 
 #Security Warning
 **Keep your Group Password secret! Only join Groups where you can thrust the other clients!**
