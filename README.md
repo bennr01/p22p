@@ -38,7 +38,10 @@ If you dont have pip installed, see https://pip.pypa.io/en/latest/installing/ fo
    - **Linux:** If you are a linux user, you probably already know how to open a shell.
 2. Start P22P:
    - Type `python <PATH-TO-YOUR-CLIENT.PY-FILE>` (insert the path to the `client.py` file there)
-3. Done
+3. Type `help` if you require help.
+4. Done
+
+If you can not connect to the default server, visit [this](http://www.p22p-bennr01.rhcloud.com/) Website and wait a minute. The server is a free OpenShift server, which shutdowns in idle-mode.
 
 #Security Warning
 **Keep your Group Password secret! Only join Groups where you can thrust the other clients!**
