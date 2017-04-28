@@ -1,6 +1,0 @@
-p22p - Peer2PeerProxy
-
-v0.3 is based on 0.2 and aims to add the following features:
-	-reserved groups (only createable if you have a signed file) (Done)
-	-single-command interface
-	-message compression (Done)
