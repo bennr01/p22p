@@ -13,7 +13,7 @@ def read(fname):
 
 setup(
     name="p22p",
-    version="0.4.1",
+    version="0.4.2",
     author="bennr01",
     author_email="benjamin99.vogt@web.de",
     description="Relay data between clients using a central server",
